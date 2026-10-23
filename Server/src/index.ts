@@ -14,6 +14,7 @@ import { createLyricsService, type LyricsService } from "./service";
 import type { BeautifulLyrics, SpotifyClientContext, TrackMetadata } from "./types";
 import { dashboardHtml } from "./dashboard";
 import { loadSourcePolicy, validSpotifyId } from "./source-policy";
+import { metricsResponse, recordRequestMetrics, detailedStatistics, type MetricsEnv } from "./metrics";
 
 const defaultService = createLyricsService({
   // amlldb: amllDbProvider,
@@ -132,7 +133,7 @@ function extractTrackMetadata(url: URL, trackId: string): TrackMetadata | undefi
   return trackMetadata;
 }
 
-export type WorkerEnv = FeedbackEnv & {
+export type WorkerEnv = FeedbackEnv & MetricsEnv & {
   RELEASE_ASSETS?: Fetcher;
   STATS?: AnalyticsEngineDataset;
   STATS_ACCOUNT_ID?: string;
@@ -149,7 +150,8 @@ async function statsResponse(env: WorkerEnv, url: URL): Promise<Response> {
     return new Response("Stats not configured", { status: 503, headers: corsHeaders });
   }
 
-  const days = Math.min(90, Math.max(1, Number(url.searchParams.get("days")) || 30));
+  const requestedDays = Number(url.searchParams.get("days"));
+  const days = Number.isFinite(requestedDays) && requestedDays > 0 ? Math.min(90, Math.max(1, Math.floor(requestedDays))) : 30;
   const sql = `SELECT blob1 AS outcome, sum(_sample_interval) AS n
     FROM lyrics_outcomes
     WHERE timestamp > NOW() - INTERVAL '${days}' DAY
@@ -160,11 +162,12 @@ async function statsResponse(env: WorkerEnv, url: URL): Promise<Response> {
     {
       method: "POST",
       headers: { Authorization: `Bearer ${env.STATS_API_TOKEN}` },
-      body: sql
+      body: sql,
+      signal: AbortSignal.timeout(10000)
     }
   );
   if (!response.ok) {
-    return new Response(`Stats query failed: ${await response.text()}`, {
+    return new Response("Statistics unavailable", {
       status: 502,
       headers: corsHeaders
     });
@@ -183,7 +186,12 @@ async function statsResponse(env: WorkerEnv, url: URL): Promise<Response> {
     ])
   );
 
-  return jsonResponse({ days, total, ...stats });
+  let metrics;
+  try { metrics = await detailedStatistics(env, days); }
+  catch { metrics = { available: false, server: [], providers: [], client: [], trend: [], latency: [] }; }
+  const result = jsonResponse({ days, total, ...stats, metrics });
+  result.headers.set("Cache-Control", "no-store");
+  return result;
 }
 
 export function createWorker(service: LyricsService): ExportedHandler<WorkerEnv> {
@@ -192,6 +200,7 @@ export function createWorker(service: LyricsService): ExportedHandler<WorkerEnv>
       ctx.waitUntil(cleanupFeedback(env.FEEDBACK_DB).catch(() => console.warn("Feedback cleanup failed")));
     },
     async fetch(request: Request, env: WorkerEnv, ctx?: ExecutionContext): Promise<Response> {
+      if (new URL(request.url).pathname === "/metrics") return metricsResponse(request, env);
       const feedback = await feedbackResponse(request, env);
       if (feedback) return feedback;
       if (request.method === "OPTIONS") {
@@ -232,7 +241,8 @@ export function createWorker(service: LyricsService): ExportedHandler<WorkerEnv>
       }
 
       if (request.method === "GET" && url.pathname === "/stats") {
-        return statsResponse(env, url);
+        try { return await statsResponse(env, url); }
+        catch { return new Response("Statistics unavailable", { status: 503, headers: { ...corsHeaders, "Cache-Control": "no-store" } }); }
       }
 
       const routeMatch = /^\/lyrics\/([^/]+)$/.exec(url.pathname);
@@ -301,6 +311,7 @@ export function createWorker(service: LyricsService): ExportedHandler<WorkerEnv>
         // Allow scope cancellation handlers to settle before snapshotting attempts.
         await Promise.resolve();
         diagnostics.durationMs = Date.now() - started;
+        recordRequestMetrics(env, diagnostics, lyrics);
         if (env.FEEDBACK_DB) {
           const record = structuredClone(diagnostics);
           const write = saveDiagnostics(env.FEEDBACK_DB, record)
